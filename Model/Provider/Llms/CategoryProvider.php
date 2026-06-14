@@ -21,6 +21,11 @@ use Magento\Catalog\Model\ResourceModel\Category\CollectionFactory;
  * - COMPACT: `- [Name](url): short description`
  * - FULL:    each category gets a `### Name` subheading followed by its full description.
  *
+ * @deprecated 3.2.0 Format-specific legacy provider. Superseded by the
+ *             single-pass {@see \Angeo\LlmsTxt\Model\Pipeline\Provider}
+ *             entity providers + format renderers. Functional while
+ *             generation_mode = legacy (and via the single-pass
+ *             compatibility pass); WILL BE REMOVED in 4.0.0.
  * @since 3.0.0
  */
 class CategoryProvider extends AbstractProvider
@@ -43,6 +48,10 @@ class CategoryProvider extends AbstractProvider
 
     public function provide(OutputContextInterface $context): iterable
     {
+        // Publish the entity type so security-aware sanitizer filters
+        // (e.g. CmsDirectiveFilter) can apply entity-specific policies.
+        $context->setShared(OutputContextInterface::SHARED_ENTITY_TYPE, 'category');
+
         $store = $context->getStore();
         $storeId = (int) $store->getId();
         $rootCategoryId = (int) $store->getRootCategoryId();

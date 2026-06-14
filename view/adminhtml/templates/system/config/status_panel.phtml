@@ -33,7 +33,8 @@ require(['jquery'], function ($) {
     'use strict';
     var $panel = $('#<?= /* @noEscape */ $panelId ?>');
     var $tbody = $panel.find('[data-role="rows"]');
-    var url = '<?= /* @noEscape */ $url ?>';
+    // json_encode → safe JS string literal (Magento secure-rendering guideline).
+    var url = <?= /* @noEscape */ json_encode($url) ?>;
 
     function escape(s) { return $('<div/>').text(s == null ? '' : s).html(); }
 

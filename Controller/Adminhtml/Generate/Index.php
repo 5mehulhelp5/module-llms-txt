@@ -12,6 +12,7 @@ use Angeo\LlmsTxt\Service\GenerationService;
 use Magento\Backend\App\Action;
 use Magento\Backend\App\Action\Context;
 use Magento\Framework\App\Action\HttpPostActionInterface;
+use Psr\Log\LoggerInterface;
 
 /**
  * Admin "Generate Now" — synchronous, in-thread, POST + CSRF protected.
@@ -28,7 +29,8 @@ class Index extends Action implements HttpPostActionInterface
 
     public function __construct(
         Context $context,
-        private readonly GenerationService $generationService
+        private readonly GenerationService $generationService,
+        private readonly LoggerInterface $logger
     ) {
         parent::__construct($context);
     }
@@ -68,8 +70,13 @@ class Index extends Action implements HttpPostActionInterface
                 );
             }
         } catch (\Throwable $e) {
+            // Do not surface raw exception internals (paths, SQL) in the UI.
+            $this->logger->error(
+                '[Angeo LlmsTxt] Admin generation failed: ' . $e->getMessage(),
+                ['exception' => $e]
+            );
             $this->messageManager->addErrorMessage(
-                __('Generation failed: %1', $e->getMessage())
+                __('Generation failed. See var/log/system.log for details.')
             );
         }
 

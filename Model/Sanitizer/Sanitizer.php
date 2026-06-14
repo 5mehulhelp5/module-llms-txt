@@ -11,6 +11,7 @@ namespace Angeo\LlmsTxt\Model\Sanitizer;
 use Angeo\LlmsTxt\Api\OutputContextInterface;
 use Angeo\LlmsTxt\Api\SanitizerFilterInterface;
 use Angeo\LlmsTxt\Api\SanitizerInterface;
+use Angeo\LlmsTxt\Model\Text\Truncator;
 use Psr\Log\LoggerInterface;
 
 /**
@@ -29,10 +30,16 @@ class Sanitizer implements SanitizerInterface
     /**
      * @param SanitizerFilterInterface[] $filters  Ordered by di.xml.
      */
+    private readonly Truncator $truncator;
+
     public function __construct(
         private readonly LoggerInterface $logger,
-        private readonly array $filters = []
+        private readonly array $filters = [],
+        ?Truncator $truncator = null
     ) {
+        // Optional with a default so existing unit tests / integrations keep
+        // constructing the class without DI. Behavior is identical either way.
+        $this->truncator = $truncator ?? new Truncator();
     }
 
     public function sanitize(
@@ -62,24 +69,12 @@ class Sanitizer implements SanitizerInterface
             }
         }
 
-        if ($maxLength !== null && $maxLength > 0 && mb_strlen($current) > $maxLength) {
-            $current = $this->truncateOnWordBoundary($current, $maxLength);
+        if ($maxLength !== null && $maxLength > 0) {
+            // Delegated to the shared Truncator (3.2.0) so the single-pass
+            // renderers truncate with byte-identical semantics.
+            $current = $this->truncator->truncate($current, $maxLength);
         }
 
         return $current;
-    }
-
-    /**
-     * Truncate at the last whitespace before $maxLength, appending an ellipsis.
-     * Falls back to a hard truncate if no whitespace is found.
-     */
-    private function truncateOnWordBoundary(string $text, int $maxLength): string
-    {
-        $hard = mb_substr($text, 0, $maxLength);
-        $lastSpace = mb_strrpos($hard, ' ');
-        if ($lastSpace !== false && $lastSpace > $maxLength * 0.7) {
-            $hard = mb_substr($hard, 0, $lastSpace);
-        }
-        return rtrim($hard) . '…';
     }
 }

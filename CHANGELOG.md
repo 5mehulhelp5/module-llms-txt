@@ -7,6 +7,279 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [3.2.0] — 2026-06-10
+
+Single-pass generation pipeline (opt-in). **Fully backward compatible**: the
+default mode remains `legacy`, all pre-3.2 behavior, file paths, events, and
+extension points keep working unchanged. Everything superseded is marked
+`@deprecated` and will be removed in **4.0.0**.
+
+### Added
+
+* **Single-pass pipeline** (`Model/Pipeline/SinglePassGenerator`). With
+  `Stores → Configuration → Angeo LLMs.txt → Performance → Generation
+  Pipeline = Single pass`, each store's catalog is iterated **once** and every
+  enabled format (llms.txt, llms-full.txt, llms.jsonl) is rendered from that
+  one pass:
+  - one frontend emulation per store (legacy: one per format),
+  - one url_rewrite warm-up per store (legacy: one per format),
+  - each entity loaded and **sanitized exactly once** (legacy: 2–3× per
+    product description),
+  - all format files written in parallel streams with atomic rename, under one
+    per-store lock (`media/angeo/llms/store_{code}.lock`).
+  Combined with 3.1.1 this gives roughly 3× faster generation on top of the
+  3.1.1 gains, with identical output files.
+* **New `@api` extension points** (implement these going forward):
+  - `Api\EntityProviderInterface` — yields format-agnostic entity records once
+    per entity (successor of the format-specific `ProviderInterface`);
+  - `Api\Data\EntityRecordInterface` + `Model\Data\EntityRecord` — immutable
+    record DTO carrying already-sanitized content;
+  - `Api\FormatRendererInterface` — serializes records into one output format;
+  - `Model\Output\FilePathResolver` — the single source of truth for generated
+    file paths (used by both pipelines and the frontend controller);
+  - `Model\Text\Truncator` — shared word-boundary truncation (the Sanitizer
+    now delegates to it; behavior is byte-identical).
+* Bundled single-pass providers/renderers registered via `di.xml`
+  (`SinglePassGenerator` → `entityProviders`, `renderers`). Third parties add
+  their own items the same way.
+* `Model/Config/Source/GenerationMode` + new system.xml field
+  `angeo_llms/performance/generation_mode` (global scope, default `legacy`).
+* Unit tests: `TruncatorTest`, including the down-truncation invariant that
+  guarantees single-pass renderers reproduce legacy truncation byte-for-byte.
+
+### Backward compatibility
+
+* `generation_mode` defaults to **legacy** — upgrading changes nothing until
+  you opt in.
+* In single-pass mode the output files, on-disk paths, served URLs, generation
+  status records, and the `angeo_llms_generation_before/after/failed` events
+  (dispatched per format) are identical to legacy.
+* **Custom providers built on the legacy `ProviderInterface` keep working in
+  both modes.** In single-pass mode they are detected automatically (anything
+  registered on the legacy generators beyond the bundled providers) and
+  executed through a compatibility pass that appends their output to the
+  corresponding format stream.
+* The only semantic difference: the `items` counter in generation status now
+  counts rendered records rather than raw stream chunks.
+
+### Deprecated (removal in 4.0.0)
+
+* `Api\ProviderInterface` and `Model\Provider\AbstractProvider` — implement
+  `Api\EntityProviderInterface` instead.
+* All eight bundled legacy providers under `Model\Provider\Llms\*` and
+  `Model\Provider\Jsonl\*` — superseded by `Model\Pipeline\Provider\*` +
+  format renderers.
+* `Model\Generator\AbstractGenerator`, `LlmsTxtGenerator`,
+  `LlmsFullTxtGenerator`, `JsonlGenerator` — superseded by
+  `SinglePassGenerator`; file-path resolution moved to `FilePathResolver`.
+* The `legacy` generation mode itself: 4.0.0 ships single-pass as the only
+  pipeline and removes everything listed above.
+
+### Changed (internal, not `@api`)
+
+* `Service\GenerationService` routes by generation mode; new constructor
+  dependency (`SinglePassGenerator`).
+* `Controller\Index\Index` resolves file paths via `FilePathResolver` instead
+  of the deprecated generators (constructor change).
+* `Model\Sanitizer\Sanitizer` accepts an optional `Truncator` (defaults
+  internally — existing instantiations and tests are unaffected).
+* `AbstractGenerator::getProviders()` added so the single-pass pipeline can
+  discover third-party legacy providers.
+
+### Upgrade notes
+
+1. `bin/magento setup:upgrade && bin/magento setup:di:compile`
+2. Optional but recommended: switch *Performance → Generation Pipeline* to
+   **Single pass**, run `bin/magento angeo:llms:generate`, and diff the
+   generated files against the legacy output for your data.
+3. If you maintain custom providers, plan their migration to
+   `EntityProviderInterface` before 4.0.0.
+
+---
+
+## [3.1.1] — 2026-06-10
+
+Performance release. No public-API changes; drop-in upgrade from 3.1.0.
+
+### Performance
+
+* **Out-of-stock filtering moved into SQL.** Both `ProductProvider`s now use
+  `StockHelper::addIsInStockFilterToCollection()` (a JOIN on
+  `cataloginventory_stock_status`) instead of one `StockRegistry` round-trip
+  per product. On a 100k-SKU catalog with *Exclude Out-of-Stock* enabled this
+  removes ~100,000 queries per format per store.
+* **Prices come from the price index.** Product collections call
+  `addPriceData($customerGroupId, $websiteId)`; the final price (group-aware,
+  special-/tier-price-aware) is read from the joined
+  `catalog_product_index_price` column instead of invoking the PHP price
+  calculation chain per product — which for configurable/bundle products
+  lazy-loads child products (another hidden N+1). A per-product fallback to the
+  legacy calculation remains for rows missing from the index (e.g. reindex
+  pending).
+* **Dedicated cron group `angeo_llms`** with `use_separate_process=1`
+  (new `etc/cron_groups.xml`). Long generation runs no longer block
+  default-group jobs (transactional emails, scheduled indexers, etc.).
+* **Default `collection_page_size` lowered 1000 → 500.** Each page holds full
+  HTML descriptions of every product in memory; 500 halves the peak without a
+  measurable throughput cost. Explicitly configured values are unaffected.
+* **Duplicate-description sanitization skipped** in `llms-full.txt`: when
+  `description` is byte-identical to `short_description` (a common merchant
+  pattern), the content is sanitized once instead of twice.
+
+### Behavior notes
+
+* *Exclude Out-of-Stock* is now strict: products whose stock status cannot be
+  resolved are excluded by the SQL filter, whereas 3.1.0 included them on
+  lookup failure ("default in stock"). With a healthy stock index the output
+  is identical.
+* Prices require the **price index to be up to date** (`bin/magento indexer:reindex
+  catalog_product_price`) — standard for any production store; stale index
+  rows fall back to the slow per-product calculation rather than emitting a
+  wrong price.
+* The cron job moved from group `default` to group `angeo_llms`. If your
+  crontab invokes `bin/magento cron:run` with explicit `--group` filters, add
+  the new group.
+* Internal constructor change (not `@api`): both `ProductProvider`s now take
+  `Magento\CatalogInventory\Helper\Stock` instead of
+  `StockRegistryInterface`. Recompile DI (`setup:di:compile`); if you extended
+  these concrete classes, update your constructors.
+
+### MSI note
+
+Stock filtering still reads the legacy `cataloginventory_stock_status` table,
+which MSI keeps in sync for the default stock. Multi-source/multi-stock setups
+that need salable-quantity semantics per stock should override the providers —
+now a single JOIN swap instead of a per-product call.
+
+---
+
+## [3.1.0] — 2026-06-10
+
+Security & hardening release following an external security code review.
+Upgrading is **strongly recommended** for all installations, especially those
+with the `.md` mirror feature enabled.
+
+### Security
+
+* **[HIGH] `.md` mirror no longer serves disabled or hidden entities**
+  (information disclosure). `Controller/Index/MdMirror` now verifies entity
+  state before rendering: products must be *Enabled*, catalog-visible, and
+  assigned to the current website; categories must be active; CMS pages must
+  be active. Previously a stale `url_rewrite` row could expose embargoed,
+  recalled, or intentionally unpublished content — including price and full
+  description — at `/{url_key}.md`. Hidden entities now return the same 404
+  as unknown paths, so their existence is not confirmed.
+* **[HIGH] `.md` mirror DoS mitigation.** Rendered markdown is now cached in
+  the Magento cache (tag `ANGEO_LLMS_MD`, TTL = configured HTTP Cache-Control
+  TTL), so crawls no longer re-trigger entity loads, CMS directive resolution,
+  and DOM-based sanitization on every request. Unknown paths are
+  negative-cached for 5 minutes to blunt enumeration sweeps; request paths
+  longer than 1024 bytes are rejected outright. The cache is flushed
+  automatically after every generation run, so mirrors never serve a stale
+  catalog state for a full TTL.
+* **[HIGH] Frontend router no longer hijacks the `*.md` URL space**
+  (route hijacking / availability). The router `sortOrder` moved from 10 to
+  70 — after the urlrewrite (20), standard (30), and CMS (60) routers — so any
+  real merchant content whose URL ends in `.md` always wins; this module only
+  claims paths that would otherwise 404. The `.md` branch is additionally
+  gated on the md-mirror feature being enabled for the resolved store: when
+  the feature is off, the router declines the match instead of swallowing the
+  request with a 404.
+* **[MEDIUM] Template-directive injection surface reduced for product content.**
+  `{{block}}` / `{{widget}}` / `{{var}}` resolution inside *product* attribute
+  content (descriptions frequently imported from supplier/PIM feeds) is now
+  controlled by a separate flag, `angeo_llms/sanitizer/resolve_directives_products`,
+  **default OFF**. When off, directives found in product content are stripped —
+  never resolved and never leaked as source. CMS pages and categories keep the
+  existing `resolve_directives` behavior. On any directive-resolution failure
+  the filter now strips directive source instead of returning it raw.
+* **[MEDIUM] `HtmlFilter` output-encoding fixes** (stored-XSS defense for
+  downstream consumers; secret-leak prevention):
+  * HTML entities are decoded *before* the final tag-strip pass, then the
+    result is stripped again — `&lt;script&gt;…&lt;/script&gt;` can no longer
+    materialize as live markup in the generated output.
+  * Unterminated `<script>` / `<style>` blocks (and unterminated HTML
+    comments) are removed to end-of-input, so inline JS — which can carry
+    analytics tokens or API keys — can never leak into `llms.txt`,
+    `llms-full.txt`, or `.md` mirrors.
+* **[MEDIUM] Wholesale-price disclosure warning.** The *Customer Group for
+  Pricing* admin field now carries an explicit warning that the generated
+  files are public and CDN-cacheable, and that selecting a logged-in / B2B
+  group publishes that group's negotiated pricing to the internet.
+* **[LOW] Admin error messages no longer expose exception internals.** The
+  "Generate Now" and "Schedule" actions log full exceptions to
+  `var/log/system.log` and show a generic message in the admin UI.
+* **[LOW] `X-Content-Type-Options: nosniff`** is now sent on all `.md` mirror
+  responses and all 404 responses (previously only on the file endpoint's
+  200 responses).
+* **[LOW] Admin status panel** embeds its polling URL via `json_encode()`
+  instead of raw string interpolation inside a `<script>` block, per Magento
+  secure-rendering guidelines.
+
+### Fixed
+
+* **Large-file serving no longer loads the whole file into PHP memory.**
+  `Controller/Index/Index` streams files above 4 MB to the client in 256 KB
+  chunks; concurrent requests for a multi-hundred-MB `llms-full.txt` can no
+  longer exhaust the PHP memory limit. `Content-Length` is now always sent.
+* **All file serving goes through Magento's `Filesystem` abstraction** —
+  no native `is_file` / `filemtime` / `file_get_contents` on raw paths —
+  making the endpoint compatible with Adobe Commerce Cloud remote storage
+  (AWS S3) drivers.
+* **Generation status writes are now concurrency-safe.**
+  `GenerationStatusRepository` performs a locked read-modify-write (flock on a
+  sidecar lock file) followed by an atomic tmp-rename, so parallel
+  generators / cron / CLI runs can no longer lose each other's updates or
+  leave a truncated `status.json`.
+* **"Schedule (Async)" no longer piles up duplicate cron jobs.** A new run is
+  only queued when no `angeo_llms_generate` row is already pending or running;
+  the admin is informed otherwise.
+* Corrected a misleading comment in `MdMirror`: the rewrite-lookup fallback
+  appends the configured `.html` URL suffix (it never tried a trailing slash).
+
+### Changed
+
+* `UrlResolver::warmUp()` streams `url_rewrite` rows from the DB cursor
+  instead of `fetchAll()`, roughly halving peak memory on very large rewrite
+  tables.
+* New public API: `AbstractGenerator::getRelativePath()` (media-relative path
+  of the generated file; preferred over `getFilePath()` for
+  Filesystem-abstraction readers). `getFilePath()` is retained for backward
+  compatibility.
+* New well-known shared-context key
+  `OutputContextInterface::SHARED_ENTITY_TYPE`; all bundled providers and the
+  `.md` mirror publish it before sanitizing so filters can apply
+  entity-specific policies. Third-party providers are encouraged to do the
+  same.
+* Admin field comments updated (md-mirror caching behavior, directive
+  resolution semantics).
+
+### Added
+
+* Config: `angeo_llms/sanitizer/resolve_directives_products` (default `0`).
+* Cache tag `ANGEO_LLMS_MD` for rendered `.md` mirrors (flush with
+  `bin/magento cache:clean` or automatically on each generation run).
+* Unit tests: `HtmlFilter` security regressions (unterminated script blocks,
+  entity-encoded markup resurrection, legitimate `<` text preservation) and
+  `CmsDirectiveFilter` product-content gating.
+
+### Upgrade notes
+
+* Run `bin/magento setup:upgrade && bin/magento cache:flush` after deploying.
+* If you relied on `{{widget}}` / `{{block}}` directives inside **product
+  descriptions** being rendered into the generated files, re-enable this
+  explicitly at *Stores → Configuration → Angeo → LLMs.txt → Content
+  Sanitization → Resolve Directives in Product Content* after reviewing the
+  security note on that field.
+* If a customization called `AbstractGenerator::getFilePath()` to read
+  generated files, consider migrating to `getRelativePath()` plus a
+  `Filesystem` media read-directory for remote-storage compatibility.
+* Behavior change: URLs ending in `.md` that collide with real merchant
+  content are now served by that content (the mirror no longer takes
+  precedence). URLs of hidden or disabled entities now return 404.
+
+---
+
 ## [3.0.5] — 2026-06-04
 
 Admin-config bugfix. Safe drop-in upgrade from 3.0.x.

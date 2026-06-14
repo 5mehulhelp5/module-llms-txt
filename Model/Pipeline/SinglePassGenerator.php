@@ -1,0 +1,407 @@
+<?php
+/**
+ * @package   Angeo_LlmsTxt
+ * @copyright Copyright (c) Angeo
+ * @license   MIT
+ */
+declare(strict_types=1);
+
+namespace Angeo\LlmsTxt\Model\Pipeline;
+
+use Angeo\LlmsTxt\Api\EntityProviderInterface;
+use Angeo\LlmsTxt\Api\FormatRendererInterface;
+use Angeo\LlmsTxt\Api\GenerationStatusRepositoryInterface;
+use Angeo\LlmsTxt\Api\OutputContextInterface;
+use Angeo\LlmsTxt\Api\ProviderInterface;
+use Angeo\LlmsTxt\Api\UrlResolverInterface;
+use Angeo\LlmsTxt\Model\Config;
+use Angeo\LlmsTxt\Model\Generator\GenerationSummary;
+use Angeo\LlmsTxt\Model\Output\FilePathResolver;
+use Angeo\LlmsTxt\Model\Output\OutputContextFactory;
+use Magento\Framework\App\Area;
+use Magento\Framework\App\Filesystem\DirectoryList;
+use Magento\Framework\Event\ManagerInterface as EventManagerInterface;
+use Magento\Framework\Filesystem;
+use Magento\Framework\Filesystem\Directory\WriteInterface;
+use Magento\Framework\View\DesignInterface;
+use Magento\Store\Api\Data\StoreInterface;
+use Magento\Store\Model\App\Emulation;
+use Magento\Store\Model\StoreManagerInterface;
+use Psr\Log\LoggerInterface;
+
+/**
+ * SINGLE-PASS generation pipeline (3.2.0, opt-in).
+ *
+ * For each eligible store the catalog is iterated EXACTLY ONCE:
+ *  - frontend emulation is set up once (legacy: once per format),
+ *  - the URL-rewrite map is read once (legacy: once per format),
+ *  - every entity is loaded and sanitized once (legacy: per format),
+ *  - each {@see EntityProviderInterface} record is rendered by every enabled
+ *    {@see FormatRendererInterface} into its own atomically-written stream.
+ *
+ * Backward compatibility:
+ *  - File names, on-disk layout, served URLs, status records, and the
+ *    angeo_llms_generation_before/after/failed events (dispatched per format)
+ *    are identical to the legacy pipeline.
+ *  - Legacy {@see ProviderInterface} providers registered by third parties on
+ *    the deprecated generators are executed in a supplemental compatibility
+ *    pass and appended to the corresponding stream (see $legacyExtraProviders).
+ *
+ * @since 3.2.0
+ */
+class SinglePassGenerator
+{
+    /** Verbosity used for legacy compatibility contexts, keyed by format. */
+    private const LEGACY_VERBOSITY = [
+        OutputContextInterface::FORMAT_LLMS_TXT      => OutputContextInterface::VERBOSITY_COMPACT,
+        OutputContextInterface::FORMAT_LLMS_FULL_TXT => OutputContextInterface::VERBOSITY_FULL,
+        OutputContextInterface::FORMAT_JSONL         => OutputContextInterface::VERBOSITY_DATASET,
+    ];
+
+    /**
+     * @param EntityProviderInterface[] $entityProviders ordered via di.xml
+     * @param FormatRendererInterface[] $renderers keyed by FORMAT_* code via di.xml
+     */
+    public function __construct(
+        private readonly StoreManagerInterface $storeManager,
+        private readonly Filesystem $filesystem,
+        private readonly LoggerInterface $logger,
+        private readonly Config $config,
+        private readonly Emulation $emulation,
+        private readonly DesignInterface $viewDesign,
+        private readonly OutputContextFactory $contextFactory,
+        private readonly UrlResolverInterface $urlResolver,
+        private readonly EventManagerInterface $eventManager,
+        private readonly GenerationStatusRepositoryInterface $statusRepository,
+        private readonly FilePathResolver $pathResolver,
+        private readonly array $entityProviders = [],
+        private readonly array $renderers = []
+    ) {
+    }
+
+    /**
+     * @param string|null $storeCode restrict to one store, or null for all
+     * @param array<string, bool> $skip ['llms_txt' => true, ...]
+     * @param array<string, ProviderInterface[]> $legacyExtraProviders
+     *        third-party legacy providers to append, keyed by format
+     * @return array<string, GenerationSummary> keyed by format (legacy-shaped)
+     */
+    public function generateAll(
+        ?string $storeCode = null,
+        array $skip = [],
+        array $legacyExtraProviders = []
+    ): array {
+        $summaries = [];
+        foreach ($this->pathResolver->getFormats() as $format) {
+            if (empty($skip[$format])) {
+                $summaries[$format] = new GenerationSummary();
+            }
+        }
+
+        if (!$this->config->isEnabled()) {
+            $this->logger->info('[Angeo LlmsTxt] Module is disabled — generation skipped.');
+            return $summaries;
+        }
+
+        $stores = $storeCode
+            ? [$this->storeManager->getStore($storeCode)]
+            : $this->storeManager->getStores();
+
+        $directory = $this->filesystem->getDirectoryWrite(DirectoryList::MEDIA);
+        $directory->create(FilePathResolver::SUB_DIR);
+
+        foreach ($stores as $store) {
+            $this->processStore($store, $directory, $summaries, $legacyExtraProviders);
+        }
+
+        return $summaries;
+    }
+
+    /**
+     * @param array<string, GenerationSummary> $summaries
+     * @param array<string, ProviderInterface[]> $legacyExtraProviders
+     */
+    private function processStore(
+        StoreInterface $store,
+        WriteInterface $directory,
+        array $summaries,
+        array $legacyExtraProviders
+    ): void {
+        $code = $store->getCode();
+        $isActive = !method_exists($store, 'isActive') || $store->isActive();
+        $storeEligible = $isActive && !$this->config->isStoreExcluded($store);
+
+        // Decide which formats run for this store; clean up stale files for the rest.
+        $activeFormats = [];
+        foreach (array_keys($summaries) as $format) {
+            if ($storeEligible && $this->isFormatEnabled($format, $store)) {
+                $activeFormats[] = $format;
+            } else {
+                $this->deleteIfExists($directory, $this->pathResolver->getRelativePath($format, $code));
+                $summaries[$format]->skip($code);
+            }
+        }
+        if ($activeFormats === []) {
+            return;
+        }
+
+        $emulated   = false;
+        $lockHandle = null;
+        $lockPath   = FilePathResolver::SUB_DIR . '/store_' . $code . '.lock';
+        $startedAt  = microtime(true);
+        /** @var array<string, array{stream: \Magento\Framework\Filesystem\File\WriteInterface, tmp: string, final: string, bytes: int, items: int}> $streams */
+        $streams = [];
+
+        try {
+            if (!$this->viewDesign->getArea()) {
+                $this->viewDesign->setArea(Area::AREA_FRONTEND);
+            }
+            $this->emulation->startEnvironmentEmulation((int) $store->getId(), Area::AREA_FRONTEND, true);
+            $emulated = true;
+
+            $this->urlResolver->reset();
+            $this->urlResolver->warmUp((int) $store->getId());
+
+            // One per-store lock covers all format streams of this pass.
+            $lockHandle = $this->acquireLock($directory, $lockPath);
+            if ($lockHandle === null) {
+                throw new \RuntimeException(sprintf('Generation already in progress for store %s', $code));
+            }
+
+            // One sanitation context for the whole pass (max verbosity).
+            $context = $this->contextFactory->create(
+                $store,
+                OutputContextInterface::FORMAT_LLMS_FULL_TXT,
+                OutputContextInterface::VERBOSITY_FULL
+            );
+
+            foreach ($activeFormats as $format) {
+                $final = $this->pathResolver->getRelativePath($format, $code);
+                $tmp   = $final . '.tmp';
+                $streams[$format] = [
+                    'stream' => $directory->openFile($tmp, 'w'),
+                    'tmp'    => $tmp,
+                    'final'  => $final,
+                    'bytes'  => 0,
+                    'items'  => 0,
+                ];
+                $this->renderer($format)->reset();
+
+                $this->eventManager->dispatch('angeo_llms_generation_before', [
+                    'store'   => $store,
+                    'format'  => $format,
+                    'context' => $context,
+                ]);
+            }
+
+            // ── THE single pass ─────────────────────────────────────────────
+            foreach ($this->entityProviders as $provider) {
+                if (!$provider instanceof EntityProviderInterface || !$provider->isApplicable($context)) {
+                    continue;
+                }
+                try {
+                    foreach ($provider->provide($context) as $record) {
+                        foreach ($streams as $format => &$s) {
+                            $emittedAny = false;
+                            foreach ($this->renderer($format)->render($record, $context) as $chunk) {
+                                if ($chunk === '') {
+                                    continue;
+                                }
+                                $s['bytes'] += $s['stream']->write($chunk);
+                                $emittedAny = true;
+                            }
+                            if ($emittedAny) {
+                                $s['items']++;
+                            }
+                        }
+                        unset($s);
+                    }
+                } catch (\Throwable $e) {
+                    $this->logger->warning(sprintf(
+                        '[Angeo LlmsTxt] Entity provider %s failed for store %s: %s',
+                        $provider::class,
+                        $code,
+                        $e->getMessage()
+                    ));
+                }
+            }
+
+            foreach ($streams as $format => &$s) {
+                foreach ($this->renderer($format)->finish($context) as $chunk) {
+                    if ($chunk !== '') {
+                        $s['bytes'] += $s['stream']->write($chunk);
+                    }
+                }
+            }
+            unset($s);
+
+            // ── Legacy compatibility pass for third-party ProviderInterface ──
+            foreach ($streams as $format => &$s) {
+                $extras = $legacyExtraProviders[$format] ?? [];
+                if ($extras === []) {
+                    continue;
+                }
+                $legacyContext = $this->contextFactory->create(
+                    $store,
+                    $format,
+                    self::LEGACY_VERBOSITY[$format]
+                );
+                foreach ($extras as $legacyProvider) {
+                    if (!$legacyProvider instanceof ProviderInterface
+                        || !$legacyProvider->isApplicable($legacyContext)
+                    ) {
+                        continue;
+                    }
+                    try {
+                        foreach ($legacyProvider->provide($legacyContext) as $chunk) {
+                            if (!is_string($chunk) || $chunk === '') {
+                                continue;
+                            }
+                            $s['bytes'] += $s['stream']->write($chunk);
+                            $s['items']++;
+                        }
+                    } catch (\Throwable $e) {
+                        $this->logger->warning(sprintf(
+                            '[Angeo LlmsTxt] Legacy provider %s failed for store %s: %s',
+                            $legacyProvider::class,
+                            $code,
+                            $e->getMessage()
+                        ));
+                    }
+                }
+            }
+            unset($s);
+
+            // ── Finalize: close, atomic rename (or drop empty), record + events ─
+            $duration = microtime(true) - $startedAt;
+            foreach ($streams as $format => $s) {
+                $s['stream']->close();
+                if ($s['bytes'] === 0) {
+                    $this->deleteIfExists($directory, $s['tmp']);
+                } else {
+                    $directory->renameFile($s['tmp'], $s['final']);
+                }
+
+                $this->statusRepository->recordSuccess($code, $format, $s['bytes'], $s['items'], $duration);
+                $this->eventManager->dispatch('angeo_llms_generation_after', [
+                    'store'    => $store,
+                    'format'   => $format,
+                    'file'     => $s['final'],
+                    'bytes'    => $s['bytes'],
+                    'items'    => $s['items'],
+                    'duration' => $duration,
+                ]);
+                $summaries[$format]->success($code, $s['bytes'], $s['items'], $duration);
+
+                $this->logger->info(sprintf(
+                    '[Angeo LlmsTxt] [single-pass] Generated %s for store %s (%d bytes, %d items, %.2fs)',
+                    $s['final'],
+                    $code,
+                    $s['bytes'],
+                    $s['items'],
+                    $duration
+                ));
+            }
+            $streams = [];
+        } catch (\Throwable $e) {
+            // Close + discard any half-written tmp streams.
+            foreach ($streams as $s) {
+                try {
+                    $s['stream']->close();
+                    $this->deleteIfExists($directory, $s['tmp']);
+                } catch (\Throwable) {
+                    // best-effort cleanup
+                }
+            }
+
+            foreach ($activeFormats as $format) {
+                $this->statusRepository->recordFailure($code, $format, $e->getMessage());
+                $this->eventManager->dispatch('angeo_llms_generation_failed', [
+                    'store'  => $store,
+                    'format' => $format,
+                    'error'  => $e->getMessage(),
+                ]);
+                $summaries[$format]->failure($code, $e->getMessage());
+            }
+
+            $this->logger->error(sprintf(
+                '[Angeo LlmsTxt] [single-pass] Failed generation for store %s: %s',
+                $code,
+                $e->getMessage()
+            ), ['exception' => $e]);
+        } finally {
+            $this->releaseLock($directory, $lockPath, $lockHandle);
+            if ($emulated) {
+                $this->emulation->stopEnvironmentEmulation();
+            }
+            $this->urlResolver->reset();
+        }
+    }
+
+    private function renderer(string $format): FormatRendererInterface
+    {
+        $renderer = $this->renderers[$format] ?? null;
+        if (!$renderer instanceof FormatRendererInterface) {
+            throw new \RuntimeException("No renderer registered for format {$format}");
+        }
+        return $renderer;
+    }
+
+    private function isFormatEnabled(string $format, StoreInterface $store): bool
+    {
+        return match ($format) {
+            OutputContextInterface::FORMAT_LLMS_TXT      => $this->config->isLlmsTxtEnabled($store),
+            OutputContextInterface::FORMAT_LLMS_FULL_TXT => $this->config->isLlmsFullTxtEnabled($store),
+            OutputContextInterface::FORMAT_JSONL         => $this->config->isJsonlEnabled($store),
+            default => false,
+        };
+    }
+
+    private function deleteIfExists(WriteInterface $directory, string $relativePath): void
+    {
+        try {
+            if ($directory->isExist($relativePath)) {
+                $directory->delete($relativePath);
+            }
+        } catch (\Throwable $e) {
+            $this->logger->warning(sprintf(
+                '[Angeo LlmsTxt] Could not delete %s: %s',
+                $relativePath,
+                $e->getMessage()
+            ));
+        }
+    }
+
+    /**
+     * @return resource|null
+     */
+    private function acquireLock(WriteInterface $directory, string $lockPath): mixed
+    {
+        $absolute = $directory->getAbsolutePath($lockPath);
+        $parent = dirname($lockPath);
+        if (!$directory->isExist($parent)) {
+            $directory->create($parent);
+        }
+        $handle = fopen($absolute, 'c+');
+        if ($handle === false) {
+            return null;
+        }
+        if (!flock($handle, LOCK_EX | LOCK_NB)) {
+            fclose($handle);
+            return null;
+        }
+        return $handle;
+    }
+
+    /**
+     * @param resource|null $handle
+     */
+    private function releaseLock(WriteInterface $directory, string $lockPath, mixed $handle): void
+    {
+        if (is_resource($handle)) {
+            flock($handle, LOCK_UN);
+            fclose($handle);
+        }
+        $this->deleteIfExists($directory, $lockPath);
+    }
+}

@@ -18,6 +18,11 @@ use Magento\Cms\Model\ResourceModel\Page\CollectionFactory;
 /**
  * Emits one JSONL record per CMS page.
  *
+ * @deprecated 3.2.0 Format-specific legacy provider. Superseded by the
+ *             single-pass {@see \Angeo\LlmsTxt\Model\Pipeline\Provider}
+ *             entity providers + format renderers. Functional while
+ *             generation_mode = legacy (and via the single-pass
+ *             compatibility pass); WILL BE REMOVED in 4.0.0.
  * @since 3.0.0
  */
 class CmsPageProvider extends AbstractProvider
@@ -40,6 +45,10 @@ class CmsPageProvider extends AbstractProvider
 
     public function provide(OutputContextInterface $context): iterable
     {
+        // Publish the entity type so security-aware sanitizer filters
+        // (e.g. CmsDirectiveFilter) can apply entity-specific policies.
+        $context->setShared(OutputContextInterface::SHARED_ENTITY_TYPE, 'cms-page');
+
         $store = $context->getStore();
         $storeId = (int) $store->getId();
         $excluded = $this->config->getCmsExcludedIdentifiers($store);

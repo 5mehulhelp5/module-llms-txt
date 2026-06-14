@@ -7,7 +7,10 @@
                 <item name="angeo_llms" xsi:type="array">
                     <item name="class"     xsi:type="string">Angeo\LlmsTxt\Controller\Router</item>
                     <item name="disable"   xsi:type="boolean">false</item>
-                    <item name="sortOrder" xsi:type="string">10</item>
+                    <!-- 70 = after urlrewrite (20), standard (30), and cms (60):
+                         real merchant content always takes precedence; this router
+                         only claims paths that would otherwise 404. -->
+                    <item name="sortOrder" xsi:type="string">70</item>
                 </item>
             </argument>
         </arguments>

@@ -6,32 +6,27 @@
  */
 declare(strict_types=1);
 
-namespace Angeo\LlmsTxt\Model\Provider\Llms;
+namespace Angeo\LlmsTxt\Model\Pipeline\Provider;
 
+use Angeo\LlmsTxt\Api\Data\EntityRecordInterface;
+use Angeo\LlmsTxt\Api\EntityProviderInterface;
 use Angeo\LlmsTxt\Api\OutputContextInterface;
 use Angeo\LlmsTxt\Api\SanitizerInterface;
 use Angeo\LlmsTxt\Api\UrlResolverInterface;
 use Angeo\LlmsTxt\Model\Config;
-use Angeo\LlmsTxt\Model\Provider\AbstractProvider;
+use Angeo\LlmsTxt\Model\Data\EntityRecord;
 use Magento\Cms\Model\ResourceModel\Page\CollectionFactory;
 
 /**
- * Emits the `## Pages` section for llms.txt / llms-full.txt.
+ * Streams CMS-page records. Content is sanitized ONCE at the maximum length
+ * any format needs (16000); renderers truncate down (compact excerpt: 500).
  *
- * CMS pages get full sanitization (Page Builder, CMS directives) because the
- * source content is typically the highest-quality AEO signal a store has.
- *
- * @deprecated 3.2.0 Format-specific legacy provider. Superseded by the
- *             single-pass {@see \Angeo\LlmsTxt\Model\Pipeline\Provider}
- *             entity providers + format renderers. Functional while
- *             generation_mode = legacy (and via the single-pass
- *             compatibility pass); WILL BE REMOVED in 4.0.0.
- * @since 3.0.0
+ * @since 3.2.0
  */
-class CmsPageProvider extends AbstractProvider
+class CmsPageEntityProvider implements EntityProviderInterface
 {
-    private const EXCERPT_MAX_COMPACT = 500;
-    private const CONTENT_MAX_FULL    = 16000;
+    /** Max of legacy CONTENT_MAX (jsonl) and CONTENT_MAX_FULL — both 16000. */
+    public const CONTENT_MAX = 16000;
 
     public function __construct(
         private readonly CollectionFactory $collectionFactory,
@@ -48,8 +43,6 @@ class CmsPageProvider extends AbstractProvider
 
     public function provide(OutputContextInterface $context): iterable
     {
-        // Publish the entity type so security-aware sanitizer filters
-        // (e.g. CmsDirectiveFilter) can apply entity-specific policies.
         $context->setShared(OutputContextInterface::SHARED_ENTITY_TYPE, 'cms-page');
 
         $store    = $context->getStore();
@@ -66,50 +59,35 @@ class CmsPageProvider extends AbstractProvider
         $pages->addFieldToSelect(['title', 'identifier', 'content', 'content_heading']);
         $pages->setOrder('sort_order', 'ASC');
 
-        $headerYielded = false;
         $count = 0;
-
         foreach ($pages as $page) {
             $title = trim((string) $page->getTitle());
             if ($title === '') {
                 continue;
             }
 
-            // Prefer URL rewrite; fall back to baseUrl + identifier.
             $url = $this->urlResolver->resolve(
                 UrlResolverInterface::ENTITY_CMS_PAGE,
                 (int) $page->getId(),
                 $storeId
             ) ?? sprintf('%s/%s', $baseUrl, $page->getIdentifier());
 
-            if (!$headerYielded) {
-                yield "## Pages\n\n";
-                $headerYielded = true;
-            }
+            // Sanitize once — renderers only truncate.
+            $content = $this->sanitizer->sanitize(
+                (string) $page->getContent(),
+                $context,
+                self::CONTENT_MAX
+            );
 
-            $label = $this->escapeMarkdown($title);
-            $rawContent = (string) $page->getContent();
-
-            if ($this->isFullTxt($context)) {
-                $body = $this->sanitizer->sanitize($rawContent, $context, self::CONTENT_MAX_FULL);
-                yield "### {$label}\n\n";
-                yield "{$url}\n\n";
-                if ($body !== '') {
-                    yield $body . "\n\n";
-                }
-            } else {
-                $excerpt = $this->sanitizer->sanitize($rawContent, $context, self::EXCERPT_MAX_COMPACT);
-                $line = "- [{$label}]({$url})";
-                if ($excerpt !== '') {
-                    $line .= ': ' . $excerpt;
-                }
-                yield $line . "\n";
-            }
+            yield new EntityRecord(
+                type: EntityRecordInterface::TYPE_CMS_PAGE,
+                entityId: (int) $page->getId(),
+                name: $title,
+                url: $url,
+                content: $content,
+                identifier: (string) $page->getIdentifier()
+            );
             $count++;
-        }
-
-        if ($headerYielded) {
-            yield "\n";
         }
 
         $context->setShared('cms_count', $count);

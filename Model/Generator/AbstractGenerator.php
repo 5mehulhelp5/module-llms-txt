@@ -42,6 +42,12 @@ use Psr\Log\LoggerInterface;
  * Subclasses only need to declare the format, verbosity, and extension.
  *
  * @since 3.0.0
+ * @deprecated 3.2.0 Legacy per-format pipeline. Superseded by the single-pass
+ *             pipeline ({@see \Angeo\LlmsTxt\Model\Pipeline\SinglePassGenerator}
+ *             + {@see \Angeo\LlmsTxt\Api\EntityProviderInterface}). Kept fully
+ *             functional while `generation_mode = legacy`; WILL BE REMOVED in
+ *             4.0.0 together with that mode.
+ * @see \Angeo\LlmsTxt\Model\Pipeline\SinglePassGenerator
  */
 abstract class AbstractGenerator
 {
@@ -371,10 +377,34 @@ abstract class AbstractGenerator
         }
     }
 
+    /**
+     * Registered legacy providers — exposed so the single-pass pipeline can
+     * detect and adapt third-party providers (BC compatibility pass).
+     *
+     * @return \Angeo\LlmsTxt\Api\ProviderInterface[]
+     * @since 3.2.0
+     */
+    public function getProviders(): array
+    {
+        return $this->providers;
+    }
+
     public function getFilePath(string $storeCode): string
     {
         $directory = $this->filesystem->getDirectoryRead(DirectoryList::MEDIA);
         return $directory->getAbsolutePath($this->getRelativeFilePath($storeCode));
+    }
+
+    /**
+     * Media-relative path of the generated file — preferred over
+     * {@see getFilePath()} for callers that read through the Filesystem
+     * abstraction (remote-storage / Adobe Commerce Cloud compatible).
+     *
+     * @since 3.1.0
+     */
+    public function getRelativePath(string $storeCode): string
+    {
+        return $this->getRelativeFilePath($storeCode);
     }
 
     public function fileExists(string $storeCode): bool

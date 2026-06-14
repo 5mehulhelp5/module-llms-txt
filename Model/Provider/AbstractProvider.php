@@ -15,6 +15,9 @@ use Angeo\LlmsTxt\Api\ProviderInterface;
  * Common skeleton for content providers — exposes `isApplicable()` defaulting to
  * true and provides a helper for the format/verbosity-based output mode.
  *
+ * @deprecated 3.2.0 Base of the legacy provider SPI — see
+ *             {@see \Angeo\LlmsTxt\Api\EntityProviderInterface}. WILL BE
+ *             REMOVED in 4.0.0.
  * @since 3.0.0
  */
 abstract class AbstractProvider implements ProviderInterface

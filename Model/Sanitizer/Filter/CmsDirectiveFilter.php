@@ -25,7 +25,19 @@ use Psr\Log\LoggerInterface;
  * Runs inside the frontend-emulation scope set up by AbstractGenerator, so
  * widgets resolve to what visitors actually see.
  *
- * Controlled by config: `angeo_llms/sanitizer/resolve_directives` (default = yes).
+ * SECURITY (3.1.0): product attribute content (descriptions) frequently comes
+ * from semi-trusted sources — supplier feeds, PIM imports, marketplace syncs.
+ * Resolving {{block}}/{{widget}} directives in that content lets whoever
+ * controls the feed pull the rendered output of arbitrary blocks into a
+ * publicly served file (template-directive injection). Directive resolution
+ * for product content is therefore gated behind a SEPARATE config flag
+ * (`angeo_llms/sanitizer/resolve_directives_products`, default OFF). When the
+ * flag is off, directives in product content are removed instead of resolved,
+ * so neither template internals nor block output leaks.
+ *
+ * Controlled by config:
+ *  - `angeo_llms/sanitizer/resolve_directives` (CMS pages / categories, default = yes)
+ *  - `angeo_llms/sanitizer/resolve_directives_products` (products, default = NO)
  *
  * @since 3.0.0
  */
@@ -40,28 +52,44 @@ class CmsDirectiveFilter implements SanitizerFilterInterface
 
     public function filter(string $content, OutputContextInterface $context): string
     {
-        if (!$this->config->shouldResolveDirectives($context->getStore())) {
-            return $content;
-        }
-
         // Cheap pre-check — avoid spinning up the filter when there's nothing to resolve.
         if (!str_contains($content, '{{')) {
             return $content;
         }
 
+        $store = $context->getStore();
+        $entityType = (string) $context->getShared(OutputContextInterface::SHARED_ENTITY_TYPE);
+
+        $resolutionAllowed = $this->config->shouldResolveDirectives($store)
+            && ($entityType !== 'product' || $this->config->shouldResolveProductDirectives($store));
+
+        if (!$resolutionAllowed) {
+            // Do NOT pass semi-trusted content through the template filter; and do
+            // NOT leak directive source either — strip the directives instead.
+            return $this->stripDirectives($content);
+        }
+
         try {
             $filter = $this->filterProvider->getPageFilter();
-            $filter->setStoreId((int) $context->getStore()->getId());
+            $filter->setStoreId((int) $store->getId());
             return (string) $filter->filter($content);
         } catch (\Throwable $e) {
-            // CMS filter throws on malformed directives; fall back to raw content rather
-            // than abort sanitization entirely.
+            // CMS filter throws on malformed directives; strip them rather than
+            // leaking raw directive source into the public output.
             $this->logger->info(sprintf(
                 '[Angeo LlmsTxt] CmsDirectiveFilter could not resolve directives in store %s: %s',
-                $context->getStore()->getCode(),
+                $store->getCode(),
                 $e->getMessage()
             ));
-            return $content;
+            return $this->stripDirectives($content);
         }
+    }
+
+    /**
+     * Remove {{...}} directive source without executing it.
+     */
+    private function stripDirectives(string $content): string
+    {
+        return preg_replace('/\{\{[^{}]*\}\}/s', '', $content) ?? $content;
     }
 }

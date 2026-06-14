@@ -6,39 +6,34 @@
  */
 declare(strict_types=1);
 
-namespace Angeo\LlmsTxt\Model\Provider\Jsonl;
+namespace Angeo\LlmsTxt\Model\Pipeline\Provider;
 
+use Angeo\LlmsTxt\Api\Data\EntityRecordInterface;
+use Angeo\LlmsTxt\Api\EntityProviderInterface;
 use Angeo\LlmsTxt\Api\OutputContextInterface;
 use Angeo\LlmsTxt\Api\SanitizerInterface;
 use Angeo\LlmsTxt\Api\UrlResolverInterface;
 use Angeo\LlmsTxt\Model\Config;
-use Angeo\LlmsTxt\Model\Provider\AbstractProvider;
+use Angeo\LlmsTxt\Model\Data\EntityRecord;
 use Magento\Catalog\Model\Product\Attribute\Source\Status;
 use Magento\Catalog\Model\Product\Visibility;
 use Magento\Catalog\Model\ResourceModel\Product\CollectionFactory;
 use Magento\CatalogInventory\Helper\Stock as StockHelper;
 
 /**
- * Emits one JSONL record per product, streamed via entity_id-cursor pagination.
+ * THE single catalog pass: each product is loaded and sanitized exactly once;
+ * the resulting record is rendered into every enabled format. Combined with
+ * the 3.1.1 SQL-level stock filter and price-index pricing this is the core
+ * win of single-pass mode (legacy mode iterates the catalog once per format).
  *
- * Memory stays bounded at one page (default 500) regardless of catalog size.
- * Each line conforms to etc/jsonl-schema.json.
- *
- * Performance (3.1.1): SQL-join stock filtering and price-index pricing —
- * see {@see \Angeo\LlmsTxt\Model\Provider\Llms\ProductProvider} for rationale.
- *
- * @deprecated 3.2.0 Format-specific legacy provider. Superseded by the
- *             single-pass {@see \Angeo\LlmsTxt\Model\Pipeline\Provider}
- *             entity providers + format renderers. Functional while
- *             generation_mode = legacy (and via the single-pass
- *             compatibility pass); WILL BE REMOVED in 4.0.0.
- * @since 3.0.0
+ * @since 3.2.0
  */
-class ProductProvider extends AbstractProvider
+class ProductEntityProvider implements EntityProviderInterface
 {
-    private const SHORT_MAX = 2000;
-    private const DESC_MAX  = 5000;
-    private const EMBED_MAX = 8000;
+    /** Max of legacy short maxes: jsonl 2000, full 5000 → sanitize once at 5000. */
+    public const SHORT_MAX = 5000;
+    /** Max of legacy description maxes: jsonl 5000, full 5000. */
+    public const DESC_MAX  = 5000;
 
     public function __construct(
         private readonly CollectionFactory $collectionFactory,
@@ -56,18 +51,16 @@ class ProductProvider extends AbstractProvider
 
     public function provide(OutputContextInterface $context): iterable
     {
-        // Publish the entity type so security-aware sanitizer filters
-        // (e.g. CmsDirectiveFilter) can apply entity-specific policies.
         $context->setShared(OutputContextInterface::SHARED_ENTITY_TYPE, 'product');
 
-        $store    = $context->getStore();
-        $storeId  = (int) $store->getId();
+        $store     = $context->getStore();
+        $storeId   = (int) $store->getId();
         $websiteId = (int) $store->getWebsiteId();
-        $pageSize = $this->config->getCollectionPageSize($store);
-        $limit    = $this->config->getProductLimit($store);
+        $pageSize  = $this->config->getCollectionPageSize($store);
+        $limit     = $this->config->getProductLimit($store);
         $excludeOos = $this->config->isExcludeOutOfStock($store);
-        $lastId   = 0;
-        $emitted  = 0;
+        $lastId    = 0;
+        $emitted   = 0;
 
         while (true) {
             $collection = $this->collectionFactory->create();
@@ -88,12 +81,9 @@ class ProductProvider extends AbstractProvider
             $collection->setOrder('entity_id', 'ASC');
             $collection->setPageSize($pageSize);
             $collection->setCurPage(1);
-
-            // Group-aware final price from the price index — one JOIN.
             $collection->addPriceData($context->getCustomerGroupId(), $websiteId);
 
             if ($excludeOos) {
-                // SQL-level stock filter — zero extra queries per product.
                 $this->stockHelper->addIsInStockFilterToCollection($collection);
             }
 
@@ -111,37 +101,25 @@ class ProductProvider extends AbstractProvider
                     continue;
                 }
 
-                $name = trim((string) $product->getName());
+                $rawShort = (string) $product->getShortDescription();
+                $rawDesc  = (string) $product->getDescription();
 
-                $short = $this->sanitizer->sanitize(
-                    (string) $product->getShortDescription(),
-                    $context,
-                    self::SHORT_MAX
-                );
-                $desc = $this->sanitizer->sanitize(
-                    (string) $product->getDescription(),
-                    $context,
-                    self::DESC_MAX
-                );
+                // Sanitize ONCE per field; dedupe identical raw inputs.
+                $short = $this->sanitizer->sanitize($rawShort, $context, self::SHORT_MAX);
+                $desc  = ($rawDesc === $rawShort)
+                    ? $short
+                    : $this->sanitizer->sanitize($rawDesc, $context, self::DESC_MAX);
 
-                yield $this->encodeJsonl([
-                    'entity_type'       => 'product',
-                    'entity_id'         => (int) $product->getId(),
-                    'store_code'        => $store->getCode(),
-                    'store_name'        => (string) $store->getName(),
-                    'sku'               => (string) $product->getSku(),
-                    'name'              => $name,
-                    'url'               => $url,
-                    'price'             => $this->resolvePrice($product, $context),
-                    'currency'          => $context->getCurrencyCode(),
-                    'short_description' => $short,
-                    'description'       => $desc,
-                    'embedding_text'    => mb_substr(
-                        trim($name . "\n" . $short . "\n" . $desc),
-                        0,
-                        self::EMBED_MAX
-                    ),
-                ]);
+                yield new EntityRecord(
+                    type: EntityRecordInterface::TYPE_PRODUCT,
+                    entityId: (int) $product->getId(),
+                    name: trim((string) $product->getName()),
+                    url: $url,
+                    content: $desc,
+                    shortContent: $short,
+                    sku: (string) $product->getSku(),
+                    price: $this->resolvePrice($product, $context)
+                );
 
                 $emitted++;
                 if ($limit > 0 && $emitted >= $limit) {
@@ -160,9 +138,6 @@ class ProductProvider extends AbstractProvider
         $context->setShared('product_count', $emitted);
     }
 
-    /**
-     * Final price, group-aware: price index first, legacy PHP chain as fallback.
-     */
     private function resolvePrice(
         \Magento\Catalog\Model\Product $product,
         OutputContextInterface $context

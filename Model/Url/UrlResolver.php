@@ -63,8 +63,6 @@ class UrlResolver implements UrlResolverInterface
             ->where('entity_type IN (?)', array_values(self::ENTITY_TO_REWRITE))
             ->where('redirect_type = ?', 0);
 
-        $rows = $connection->fetchAll($select);
-
         $bucket = [
             UrlResolverInterface::ENTITY_PRODUCT  => [],
             UrlResolverInterface::ENTITY_CATEGORY => [],
@@ -72,7 +70,10 @@ class UrlResolver implements UrlResolverInterface
         ];
 
         $reverse = array_flip(self::ENTITY_TO_REWRITE);
-        foreach ($rows as $row) {
+        // Stream rows instead of fetchAll(): avoids materializing a second full
+        // copy of the result set, halving peak memory on very large rewrite tables.
+        $statement = $connection->query($select);
+        while (($row = $statement->fetch()) !== false) {
             $type = $reverse[$row['entity_type']] ?? null;
             if ($type === null) {
                 continue;

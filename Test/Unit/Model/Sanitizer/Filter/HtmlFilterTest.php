@@ -68,4 +68,36 @@ class HtmlFilterTest extends TestCase
     {
         self::assertSame('', $this->filter->filter('', $this->context));
     }
+
+    /**
+     * SECURITY (3.1.0): an unterminated <script> block must be removed to the
+     * end of input — inline JS sometimes carries analytics tokens or API keys
+     * that must never leak into the public files.
+     */
+    public function testUnterminatedScriptBlockIsFullyRemoved(): void
+    {
+        $html = '<p>Safe.</p><script>var apiKey="SECRET123";';
+        $out = $this->filter->filter($html, $this->context);
+        self::assertSame('Safe.', $out);
+        self::assertStringNotContainsString('SECRET123', $out);
+    }
+
+    /**
+     * SECURITY (3.1.0): entity-encoded markup must not be resurrected into
+     * live tags by the entity-decoding step (stored-XSS defense for consumers
+     * that render the .md mirror as HTML).
+     */
+    public function testEntityEncodedScriptDoesNotBecomeLiveMarkup(): void
+    {
+        $html = 'Before &lt;script&gt;alert(1)&lt;/script&gt; after';
+        $out = $this->filter->filter($html, $this->context);
+        self::assertStringNotContainsString('<script', $out);
+        self::assertStringNotContainsString('alert(1)', $out);
+    }
+
+    public function testLegitimateAngleBracketTextSurvives(): void
+    {
+        $out = $this->filter->filter('Price is 5 < 10 EUR', $this->context);
+        self::assertSame('Price is 5 < 10 EUR', $out);
+    }
 }

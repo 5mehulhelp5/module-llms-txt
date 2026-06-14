@@ -48,6 +48,19 @@ interface OutputContextInterface
     public const VERBOSITY_DATASET = 'dataset';
 
     /**
+     * Well-known shared-bag key (see {@see setShared()}): the type of entity whose
+     * content is currently being sanitized — 'product', 'category', or 'cms-page'.
+     *
+     * Providers set this before calling the sanitizer so security-sensitive filters
+     * (e.g. {@see \Angeo\LlmsTxt\Model\Sanitizer\Filter\CmsDirectiveFilter}) can apply
+     * entity-specific policies, such as refusing to resolve {{block}}/{{widget}}
+     * directives inside product attributes that may originate from imported feeds.
+     *
+     * @since 3.1.0
+     */
+    public const SHARED_ENTITY_TYPE = 'current_entity_type';
+
+    /**
      * Get the store this generation is running for.
      */
     public function getStore(): StoreInterface;

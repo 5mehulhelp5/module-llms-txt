@@ -6,33 +6,30 @@
  */
 declare(strict_types=1);
 
-namespace Angeo\LlmsTxt\Model\Provider\Jsonl;
+namespace Angeo\LlmsTxt\Model\Pipeline\Provider;
 
+use Angeo\LlmsTxt\Api\Data\EntityRecordInterface;
+use Angeo\LlmsTxt\Api\EntityProviderInterface;
 use Angeo\LlmsTxt\Api\OutputContextInterface;
 use Angeo\LlmsTxt\Api\SanitizerInterface;
 use Angeo\LlmsTxt\Api\UrlResolverInterface;
 use Angeo\LlmsTxt\Model\Config;
-use Angeo\LlmsTxt\Model\Provider\AbstractProvider;
+use Angeo\LlmsTxt\Model\Data\EntityRecord;
 use Magento\Catalog\Model\ResourceModel\Category\CollectionFactory;
 
 /**
- * Emits one JSONL record per category, with sanitized description and an
- * embedding_text field optimized for vector indexing.
+ * Streams category records. Description is sanitized ONCE at the maximum
+ * length any format needs (4000); renderers truncate down (compact: 200).
  *
- * @deprecated 3.2.0 Format-specific legacy provider. Superseded by the
- *             single-pass {@see \Angeo\LlmsTxt\Model\Pipeline\Provider}
- *             entity providers + format renderers. Functional while
- *             generation_mode = legacy (and via the single-pass
- *             compatibility pass); WILL BE REMOVED in 4.0.0.
- * @since 3.0.0
+ * @since 3.2.0
  */
-class CategoryProvider extends AbstractProvider
+class CategoryEntityProvider implements EntityProviderInterface
 {
-    private const DESC_MAX = 4000;
-    private const EMBED_MAX = 8000;
+    /** Max of legacy DESC_MAX (jsonl, 4000) and DESC_MAX_FULL (full txt, 4000). */
+    public const CONTENT_MAX = 4000;
 
     public function __construct(
-        private readonly CollectionFactory $collectionFactory,
+        private readonly CollectionFactory $categoryCollectionFactory,
         private readonly SanitizerInterface $sanitizer,
         private readonly UrlResolverInterface $urlResolver,
         private readonly Config $config
@@ -46,21 +43,20 @@ class CategoryProvider extends AbstractProvider
 
     public function provide(OutputContextInterface $context): iterable
     {
-        // Publish the entity type so security-aware sanitizer filters
-        // (e.g. CmsDirectiveFilter) can apply entity-specific policies.
         $context->setShared(OutputContextInterface::SHARED_ENTITY_TYPE, 'category');
 
         $store = $context->getStore();
         $storeId = (int) $store->getId();
         $rootCategoryId = (int) $store->getRootCategoryId();
 
-        $collection = $this->collectionFactory->create();
+        $collection = $this->categoryCollectionFactory->create();
         $collection->setStoreId($storeId);
         $collection->addAttributeToSelect(['name', 'description', 'url_key']);
         $collection->addAttributeToFilter('is_active', 1);
         $collection->addAttributeToFilter('path', ['like' => '1/' . $rootCategoryId . '/%']);
         $collection->setOrder('position', 'ASC');
 
+        $count = 0;
         foreach ($collection as $category) {
             $name = trim((string) $category->getName());
             if ($name === '') {
@@ -76,22 +72,23 @@ class CategoryProvider extends AbstractProvider
                 continue;
             }
 
+            // Sanitize once — renderers only truncate.
             $description = $this->sanitizer->sanitize(
                 (string) $category->getDescription(),
                 $context,
-                self::DESC_MAX
+                self::CONTENT_MAX
             );
 
-            yield $this->encodeJsonl([
-                'entity_type'    => 'category',
-                'entity_id'      => (int) $category->getId(),
-                'store_code'     => $store->getCode(),
-                'store_name'     => (string) $store->getName(),
-                'name'           => $name,
-                'url'            => $url,
-                'description'    => $description,
-                'embedding_text' => mb_substr(trim($name . "\n" . $description), 0, self::EMBED_MAX),
-            ]);
+            yield new EntityRecord(
+                type: EntityRecordInterface::TYPE_CATEGORY,
+                entityId: (int) $category->getId(),
+                name: $name,
+                url: $url,
+                content: $description
+            );
+            $count++;
         }
+
+        $context->setShared('category_count', $count);
     }
 }

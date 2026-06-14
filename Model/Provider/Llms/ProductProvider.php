@@ -16,7 +16,7 @@ use Angeo\LlmsTxt\Model\Provider\AbstractProvider;
 use Magento\Catalog\Model\Product\Attribute\Source\Status;
 use Magento\Catalog\Model\Product\Visibility;
 use Magento\Catalog\Model\ResourceModel\Product\CollectionFactory;
-use Magento\CatalogInventory\Api\StockRegistryInterface;
+use Magento\CatalogInventory\Helper\Stock as StockHelper;
 
 /**
  * Emits the products section (`## Products` or under `## Optional`) for llms.txt
@@ -29,6 +29,20 @@ use Magento\CatalogInventory\Api\StockRegistryInterface;
  * products go under `## Optional` so context-budget-constrained LLMs can drop
  * them without losing the more semantically-important categories and pages.
  *
+ * Performance (3.1.1):
+ *  - Out-of-stock filtering is a SQL join (StockHelper::addIsInStockFilterToCollection)
+ *    instead of one StockRegistry round-trip per product — removes N+1.
+ *  - Prices come from the price index via Collection::addPriceData() (already
+ *    group-aware, special/tier-price aware) instead of invoking the PHP price
+ *    calculation chain per product (which lazy-loads children for configurable
+ *    and bundle products). A per-product fallback remains for rows missing from
+ *    the index.
+ *
+ * @deprecated 3.2.0 Format-specific legacy provider. Superseded by the
+ *             single-pass {@see \Angeo\LlmsTxt\Model\Pipeline\Provider}
+ *             entity providers + format renderers. Functional while
+ *             generation_mode = legacy (and via the single-pass
+ *             compatibility pass); WILL BE REMOVED in 4.0.0.
  * @since 3.0.0
  */
 class ProductProvider extends AbstractProvider
@@ -40,7 +54,7 @@ class ProductProvider extends AbstractProvider
         private readonly CollectionFactory $collectionFactory,
         private readonly SanitizerInterface $sanitizer,
         private readonly UrlResolverInterface $urlResolver,
-        private readonly StockRegistryInterface $stockRegistry,
+        private readonly StockHelper $stockHelper,
         private readonly Config $config
     ) {
     }
@@ -52,8 +66,13 @@ class ProductProvider extends AbstractProvider
 
     public function provide(OutputContextInterface $context): iterable
     {
+        // Publish the entity type so security-aware sanitizer filters
+        // (e.g. CmsDirectiveFilter) can apply entity-specific policies.
+        $context->setShared(OutputContextInterface::SHARED_ENTITY_TYPE, 'product');
+
         $store    = $context->getStore();
         $storeId  = (int) $store->getId();
+        $websiteId = (int) $store->getWebsiteId();
         $pageSize = $this->config->getCollectionPageSize($store);
         $limit    = $this->config->getProductLimit($store);
         $excludeOos = $this->config->isExcludeOutOfStock($store);
@@ -82,14 +101,19 @@ class ProductProvider extends AbstractProvider
             $collection->setPageSize($pageSize);
             $collection->setCurPage(1);
 
+            // Group-aware final price from the price index — one JOIN, zero
+            // per-product PHP price calculation.
+            $collection->addPriceData($context->getCustomerGroupId(), $websiteId);
+
+            if ($excludeOos) {
+                // SQL-level stock filter — zero extra queries per product.
+                $this->stockHelper->addIsInStockFilterToCollection($collection);
+            }
+
             $hasRows = false;
             foreach ($collection as $product) {
                 $hasRows = true;
                 $lastId  = (int) $product->getId();
-
-                if ($excludeOos && !$this->isInStock($product, $storeId)) {
-                    continue;
-                }
 
                 $url = $this->urlResolver->resolve(
                     UrlResolverInterface::ENTITY_PRODUCT,
@@ -142,19 +166,18 @@ class ProductProvider extends AbstractProvider
     ): string {
         $name  = $this->escapeMarkdown(trim((string) $product->getName()));
         $price = $this->resolvePrice($product, $context);
-        $store = $context->getStore();
 
         if ($this->isFullTxt($context)) {
-            $short = $this->sanitizer->sanitize(
-                (string) $product->getShortDescription(),
-                $context,
-                self::DESC_MAX_FULL
-            );
-            $desc = $this->sanitizer->sanitize(
-                (string) $product->getDescription(),
-                $context,
-                self::DESC_MAX_FULL
-            );
+            $rawShort = (string) $product->getShortDescription();
+            $rawDesc  = (string) $product->getDescription();
+
+            $short = $this->sanitizer->sanitize($rawShort, $context, self::DESC_MAX_FULL);
+            // Merchants often duplicate short_description into description —
+            // don't pay for a second sanitization pass when input is identical.
+            $desc = ($rawDesc === $rawShort)
+                ? $short
+                : $this->sanitizer->sanitize($rawDesc, $context, self::DESC_MAX_FULL);
+
             $out = "### {$name}\n\n{$url}\n\n";
             if ($price !== null) {
                 $out .= sprintf("Price: %s %s\n\n", $price, $context->getCurrencyCode());
@@ -188,30 +211,27 @@ class ProductProvider extends AbstractProvider
         return $line . "\n";
     }
 
+    /**
+     * Final price, group-aware. Primary source: the price-index column joined by
+     * addPriceData(). Fallback (index row missing, e.g. reindex pending): the
+     * legacy per-product calculation.
+     */
     private function resolvePrice(
         \Magento\Catalog\Model\Product $product,
         OutputContextInterface $context
     ): ?string {
-        // Use final_price so special prices in window are reflected.
+        $indexed = $product->getData('final_price');
+        if ($indexed !== null && (float) $indexed > 0.0) {
+            return number_format((float) $indexed, 2, '.', '');
+        }
+
+        // Fallback: full PHP price chain (slow) — only for products the index
+        // doesn't cover yet.
         $product->setCustomerGroupId($context->getCustomerGroupId());
         $price = $product->getFinalPrice();
         if ($price === null || (float) $price <= 0.0) {
             return null;
         }
         return number_format((float) $price, 2, '.', '');
-    }
-
-    private function isInStock(\Magento\Catalog\Model\Product $product, int $storeId): bool
-    {
-        try {
-            $status = $this->stockRegistry->getProductStockStatus(
-                (int) $product->getId(),
-                $product->getStore() ? (int) $product->getStore()->getWebsiteId() : null
-            );
-            return (int) $status === 1;
-        } catch (\Throwable) {
-            // If stock isn't resolvable, default to "in stock" — better to over-include than under-include.
-            return true;
-        }
     }
 }

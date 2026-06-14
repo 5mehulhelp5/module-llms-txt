@@ -11,10 +11,9 @@ namespace Angeo\LlmsTxt\Model\Repository;
 use Angeo\LlmsTxt\Api\Data\GenerationStatusInterface;
 use Angeo\LlmsTxt\Api\GenerationStatusRepositoryInterface;
 use Angeo\LlmsTxt\Model\Data\GenerationStatus;
-use Magento\Framework\App\Cache\TypeListInterface;
+use Magento\Framework\App\Filesystem\DirectoryList;
 use Magento\Framework\Filesystem;
 use Magento\Framework\Filesystem\Directory\WriteInterface;
-use Magento\Framework\App\Filesystem\DirectoryList;
 use Magento\Framework\Serialize\SerializerInterface;
 use Psr\Log\LoggerInterface;
 
@@ -29,11 +28,18 @@ use Psr\Log\LoggerInterface;
  * Using a single var/ JSON file keeps writes cheap and removes any setup_module
  * dependency. The file is created on first write; reads tolerate a missing file.
  *
+ * Concurrency (3.1.0): three generators × cron × CLI can update the file in
+ * parallel. Every mutation now runs as a locked read-modify-write (flock on a
+ * sidecar .lock file) followed by an atomic tmp-rename, so concurrent passes
+ * can no longer lose each other's updates or leave a truncated JSON file.
+ *
  * @since 3.0.0
  */
 class GenerationStatusRepository implements GenerationStatusRepositoryInterface
 {
+    private const DIR  = 'angeo_llms';
     private const FILE = 'angeo_llms/status.json';
+    private const LOCK = 'angeo_llms/status.json.lock';
 
     private ?WriteInterface $directory = null;
     /** @var array<string, array<string, mixed>>|null */
@@ -99,15 +105,71 @@ class GenerationStatusRepository implements GenerationStatusRepositoryInterface
         return $out;
     }
 
+    /**
+     * Locked read-modify-write: reload the on-disk state INSIDE the lock so a
+     * concurrent generator's update made since our last read is not clobbered.
+     */
     private function mutate(string $storeCode, string $format, array $row): void
     {
-        $data = $this->load();
-        $data[$this->key($storeCode, $format)] = array_merge(
-            ['store_code' => $storeCode, 'format' => $format],
-            $row
-        );
-        $this->data = $data;
-        $this->persist();
+        $dir = $this->getDirectory();
+        $lockHandle = null;
+
+        try {
+            $dir->create(self::DIR);
+            $lockHandle = $this->acquireLock($dir);
+
+            // Re-read under the lock — drop any stale in-memory copy.
+            $this->data = null;
+            $data = $this->load();
+            $data[$this->key($storeCode, $format)] = array_merge(
+                ['store_code' => $storeCode, 'format' => $format],
+                $row
+            );
+            $this->data = $data;
+
+            // Atomic write: tmp + rename so readers never observe a torn file.
+            $tmp = self::FILE . '.tmp';
+            $dir->writeFile($tmp, $this->serializer->serialize($this->data));
+            $dir->renameFile($tmp, self::FILE);
+        } catch (\Throwable $e) {
+            $this->logger->warning(sprintf(
+                '[Angeo LlmsTxt] Could not write generation status file: %s',
+                $e->getMessage()
+            ));
+        } finally {
+            $this->releaseLock($lockHandle);
+        }
+    }
+
+    /**
+     * Blocking exclusive lock — status writes are tiny, so waiting briefly is
+     * preferable to dropping an update.
+     *
+     * @return resource|null
+     */
+    private function acquireLock(WriteInterface $dir): mixed
+    {
+        $absolute = $dir->getAbsolutePath(self::LOCK);
+        $handle = fopen($absolute, 'c+');
+        if ($handle === false) {
+            return null;
+        }
+        if (!flock($handle, LOCK_EX)) {
+            fclose($handle);
+            return null;
+        }
+        return $handle;
+    }
+
+    /**
+     * @param resource|null $handle
+     */
+    private function releaseLock(mixed $handle): void
+    {
+        if (is_resource($handle)) {
+            flock($handle, LOCK_UN);
+            fclose($handle);
+        }
     }
 
     private function key(string $storeCode, string $format): string
@@ -140,23 +202,6 @@ class GenerationStatusRepository implements GenerationStatusRepositoryInterface
             $this->data = [];
         }
         return $this->data;
-    }
-
-    private function persist(): void
-    {
-        if ($this->data === null) {
-            return;
-        }
-        $dir = $this->getDirectory();
-        try {
-            $dir->create('angeo_llms');
-            $dir->writeFile(self::FILE, $this->serializer->serialize($this->data));
-        } catch (\Throwable $e) {
-            $this->logger->warning(sprintf(
-                '[Angeo LlmsTxt] Could not write generation status file: %s',
-                $e->getMessage()
-            ));
-        }
     }
 
     private function getDirectory(): WriteInterface

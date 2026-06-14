@@ -9,6 +9,14 @@ catalog efficiently.
 [![PHP](https://img.shields.io/badge/PHP-8.2%20%7C%208.3%20%7C%208.4-blue)]()
 [![License](https://img.shields.io/badge/license-MIT-green)]()
 
+> **Current version: 3.2.0** — performance release. Opt-in **single-pass
+> generation pipeline**: one catalog pass per store renders all enabled
+> formats (default stays `legacy`; legacy pipeline and the old
+> `ProviderInterface` SPI are deprecated and will be removed in 4.0.0).
+> Builds on 3.1.1 (SQL-level stock filtering, price-index pricing, dedicated
+> cron group) and 3.1.0 (security & hardening). See
+> [CHANGELOG.md](CHANGELOG.md) for details and upgrade notes.
+
 ---
 
 ## What this module does

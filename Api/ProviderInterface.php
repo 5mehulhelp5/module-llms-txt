@@ -29,6 +29,13 @@ namespace Angeo\LlmsTxt\Api;
  * a single string — that would defeat the streaming design.
  *
  * @api
+ * @deprecated 3.2.0 Legacy format-specific SPI. Implement
+ *             {@see \Angeo\LlmsTxt\Api\EntityProviderInterface} instead:
+ *             one format-agnostic record per entity, rendered into every
+ *             enabled format in a single catalog pass. Existing
+ *             implementations keep working in BOTH modes until 4.0.0
+ *             (single-pass runs them through a compatibility pass).
+ * @see \Angeo\LlmsTxt\Api\EntityProviderInterface
  * @since 3.0.0
  */
 interface ProviderInterface

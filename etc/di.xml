@@ -84,4 +84,28 @@
             </argument>
         </arguments>
     </type>
+
+    <!-- ─── Single-pass pipeline (3.2.0) ──────────────────────────────
+         One catalog pass per store renders every enabled format.
+         Entity providers stream format-agnostic records (order matters:
+         store record first — it carries the H1/blockquote); renderers are
+         keyed by the FORMAT_* code they serialize.
+         The legacy generator/provider wiring above is DEPRECATED and will be
+         removed in 4.0.0 together with generation_mode = legacy.
+      ── -->
+    <type name="Angeo\LlmsTxt\Model\Pipeline\SinglePassGenerator">
+        <arguments>
+            <argument name="entityProviders" xsi:type="array">
+                <item name="store"    xsi:type="object">Angeo\LlmsTxt\Model\Pipeline\Provider\StoreEntityProvider</item>
+                <item name="category" xsi:type="object">Angeo\LlmsTxt\Model\Pipeline\Provider\CategoryEntityProvider</item>
+                <item name="cms"      xsi:type="object">Angeo\LlmsTxt\Model\Pipeline\Provider\CmsPageEntityProvider</item>
+                <item name="product"  xsi:type="object">Angeo\LlmsTxt\Model\Pipeline\Provider\ProductEntityProvider</item>
+            </argument>
+            <argument name="renderers" xsi:type="array">
+                <item name="llms_txt"      xsi:type="object">Angeo\LlmsTxt\Model\Pipeline\Renderer\LlmsTxtRenderer</item>
+                <item name="llms_full_txt" xsi:type="object">Angeo\LlmsTxt\Model\Pipeline\Renderer\LlmsFullTxtRenderer</item>
+                <item name="jsonl"         xsi:type="object">Angeo\LlmsTxt\Model\Pipeline\Renderer\JsonlRenderer</item>
+            </argument>
+        </arguments>
+    </type>
 </config>

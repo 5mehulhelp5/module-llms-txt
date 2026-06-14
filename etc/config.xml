@@ -26,12 +26,18 @@
             </formats>
             <sanitizer>
                 <resolve_directives>1</resolve_directives>
+                <!-- SECURITY: default OFF — product content may originate from
+                     semi-trusted import feeds; see system.xml field comment. -->
+                <resolve_directives_products>0</resolve_directives_products>
                 <page_builder_strategy>exclude</page_builder_strategy>
                 <page_builder_excluded_types>products,banner,slider,slide,video,map,buttons,button-item,block,dynamic-block,divider,spacer</page_builder_excluded_types>
                 <page_builder_allowed_types>text,heading,html,tabs,tab-item,row,column,column-group</page_builder_allowed_types>
             </sanitizer>
             <performance>
-                <collection_page_size>1000</collection_page_size>
+                <collection_page_size>500</collection_page_size>
+                <!-- BC: default stays legacy in 3.2.x; single_pass becomes the
+                     only pipeline in 4.0.0. Opt in deliberately. -->
+                <generation_mode>legacy</generation_mode>
             </performance>
             <http>
                 <cache_ttl_seconds>3600</cache_ttl_seconds>

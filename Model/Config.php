@@ -48,12 +48,25 @@ class Config
 
     // ─── Sanitizer ─────────────────────────────────────────────────────────
     public const XML_PATH_RESOLVE_DIRECTIVES = 'angeo_llms/sanitizer/resolve_directives';
+    public const XML_PATH_RESOLVE_DIRECTIVES_PRODUCTS = 'angeo_llms/sanitizer/resolve_directives_products';
     public const XML_PATH_PB_STRATEGY        = 'angeo_llms/sanitizer/page_builder_strategy';
     public const XML_PATH_PB_EXCLUDED_TYPES  = 'angeo_llms/sanitizer/page_builder_excluded_types';
     public const XML_PATH_PB_ALLOWED_TYPES   = 'angeo_llms/sanitizer/page_builder_allowed_types';
 
     // ─── Performance ───────────────────────────────────────────────────────
     public const XML_PATH_PAGE_SIZE          = 'angeo_llms/performance/collection_page_size';
+    public const XML_PATH_GENERATION_MODE    = 'angeo_llms/performance/generation_mode';
+
+    /**
+     * Generation pipeline modes (3.2.0).
+     *
+     * LEGACY      — three independent generators, one catalog pass per format
+     *               (pre-3.2 behavior; default). DEPRECATED: will be removed
+     *               in 4.0.0, when single-pass becomes the only pipeline.
+     * SINGLE_PASS — one catalog pass per store renders all enabled formats.
+     */
+    public const MODE_LEGACY      = 'legacy';
+    public const MODE_SINGLE_PASS = 'single_pass';
 
     // ─── HTTP ──────────────────────────────────────────────────────────────
     public const XML_PATH_CACHE_TTL          = 'angeo_llms/http/cache_ttl_seconds';
@@ -249,6 +262,24 @@ class Config
         );
     }
 
+    /**
+     * Whether {{block}}/{{widget}}/{{var}} directives inside PRODUCT attribute
+     * content should be resolved. Default NO: product descriptions often come
+     * from imported feeds (semi-trusted), and resolving directives there is a
+     * template-directive-injection surface. When disabled, directives in product
+     * content are stripped instead of resolved.
+     *
+     * @since 3.1.0
+     */
+    public function shouldResolveProductDirectives(StoreInterface $store): bool
+    {
+        return $this->scopeConfig->isSetFlag(
+            self::XML_PATH_RESOLVE_DIRECTIVES_PRODUCTS,
+            ScopeInterface::SCOPE_STORE,
+            $store->getId()
+        );
+    }
+
     public function getPageBuilderStrategy(StoreInterface $store): string
     {
         $value = (string) $this->scopeConfig->getValue(
@@ -292,7 +323,27 @@ class Config
             $store->getId()
         );
 
-        return $size > 0 ? $size : 1000;
+        return $size > 0 ? $size : 500;
+    }
+
+    /**
+     * Active generation pipeline. Global scope — mixing modes per store would
+     * make concurrent runs fight over the same output files.
+     *
+     * @since 3.2.0
+     */
+    public function getGenerationMode(): string
+    {
+        $mode = (string) $this->scopeConfig->getValue(self::XML_PATH_GENERATION_MODE);
+        return $mode === self::MODE_SINGLE_PASS ? self::MODE_SINGLE_PASS : self::MODE_LEGACY;
+    }
+
+    /**
+     * @since 3.2.0
+     */
+    public function isSinglePassEnabled(): bool
+    {
+        return $this->getGenerationMode() === self::MODE_SINGLE_PASS;
     }
 
     public function getHttpCacheTtl(): int

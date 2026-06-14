@@ -121,7 +121,7 @@
                        showInDefault="1" showInWebsite="1" showInStore="1">
                     <label>Customer Group for Pricing</label>
                     <source_model>Angeo\LlmsTxt\Model\Config\Source\CustomerGroup</source_model>
-                    <comment>Product prices reflect this group's final price (special prices, group prices). Default: NOT LOGGED IN.</comment>
+                    <comment><![CDATA[Product prices reflect this group's final price (special prices, group prices). Default: NOT LOGGED IN.<br/><strong style="color:#c00;">⚠ Security warning:</strong> the generated files are <strong>publicly accessible and CDN-cacheable</strong>. Selecting a logged-in / wholesale / B2B group publishes that group's negotiated pricing to anyone on the internet, including competitors. Only change this if that is explicitly intended.]]></comment>
                 </field>
             </group>
 
@@ -155,7 +155,7 @@
                        showInDefault="1" showInWebsite="1" showInStore="1">
                     <label>Serve /url-key.md Mirrors</label>
                     <source_model>Magento\Config\Model\Config\Source\Yesno</source_model>
-                    <comment><![CDATA[When yes, serves a clean Markdown version of every product/category/CMS page at <code>{url}.md</code>. Generated on the fly — no extra storage.]]></comment>
+                    <comment><![CDATA[When yes, serves a clean Markdown version of every <em>enabled and visible</em> product/category/CMS page at <code>{url}.md</code>. Rendered on first request, then served from the Magento cache (TTL = HTTP Cache-Control TTL below; cache tag <code>ANGEO_LLMS_MD</code>).]]></comment>
                 </field>
             </group>
 
@@ -168,7 +168,17 @@
                        showInDefault="1" showInWebsite="1" showInStore="1">
                     <label>Resolve CMS Directives</label>
                     <source_model>Magento\Config\Model\Config\Source\Yesno</source_model>
-                    <comment><![CDATA[Renders <code>{{widget}}</code>, <code>{{block}}</code>, <code>{{var}}</code>, and <code>{{store}}</code> directives via Magento's frontend filter before stripping HTML. Prevents directive source leaking into llms.txt.]]></comment>
+                    <comment><![CDATA[Renders <code>{{widget}}</code>, <code>{{block}}</code>, <code>{{var}}</code>, and <code>{{store}}</code> directives via Magento's frontend filter before stripping HTML. Applies to CMS pages and categories. When disabled, directive source is stripped (never leaked).]]></comment>
+                </field>
+
+                <field id="resolve_directives_products" translate="label comment" type="select" sortOrder="15"
+                       showInDefault="1" showInWebsite="1" showInStore="1">
+                    <label>Resolve Directives in Product Content</label>
+                    <source_model>Magento\Config\Model\Config\Source\Yesno</source_model>
+                    <comment><![CDATA[<strong style="color:#c00;">⚠ Security:</strong> product descriptions often come from imported supplier/PIM feeds. Resolving <code>{{block}}</code>/<code>{{widget}}</code> directives in that content lets whoever controls the feed pull arbitrary block output into a publicly served file (template-directive injection). Keep <strong>No</strong> unless all product content is authored by trusted admins. When No, directives in product content are stripped instead of resolved.]]></comment>
+                    <depends>
+                        <field id="resolve_directives">1</field>
+                    </depends>
                 </field>
 
                 <field id="page_builder_strategy" translate="label comment" type="select" sortOrder="20"
@@ -202,11 +212,18 @@
                    showInDefault="1" showInWebsite="0" showInStore="0">
                 <label>Performance</label>
 
+                <field id="generation_mode" translate="label comment" type="select" sortOrder="5"
+                       showInDefault="1" showInWebsite="0" showInStore="0">
+                    <label>Generation Pipeline</label>
+                    <source_model>Angeo\LlmsTxt\Model\Config\Source\GenerationMode</source_model>
+                    <comment><![CDATA[<strong>Single pass</strong> iterates the catalog once per store and renders every enabled format from that one pass (≈3× faster, one url_rewrite read, one sanitization per entity). Output files are identical to legacy. <strong>Legacy</strong> keeps the pre-3.2 per-format passes and is <em>deprecated — it will be removed in 4.0.0</em>. Custom providers built on the legacy <code>ProviderInterface</code> keep working in both modes (via a compatibility pass in single-pass mode) until 4.0.0.]]></comment>
+                </field>
+
                 <field id="collection_page_size" translate="label comment" type="text" sortOrder="10"
                        showInDefault="1" showInWebsite="0" showInStore="0">
                     <label>Collection Page Size</label>
                     <validate>validate-digits validate-digits-range digits-range-0-1000000</validate>
-                    <comment>Number of products loaded per collection page during streaming. Default 1000. Lower this if you hit memory limits.</comment>
+                    <comment>Number of products loaded per collection page during streaming. Default 500 (each page holds full descriptions in memory). Lower this if you hit memory limits; raise only on hosts with generous PHP memory.</comment>
                 </field>
             </group>
 

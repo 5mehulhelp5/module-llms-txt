@@ -18,6 +18,16 @@ use Angeo\LlmsTxt\Api\SanitizerFilterInterface;
  * content it sees has already had its widgets resolved and its Page Builder
  * noise removed.
  *
+ * Security notes (3.1.0):
+ *  - Entities are decoded BEFORE the final strip pass, then the result is
+ *    tag-stripped again. Previously `&lt;script&gt;…&lt;/script&gt;` decoded
+ *    into a literal `<script>` string AFTER strip_tags had already run, which
+ *    could land active markup in the output. Downstream consumers that render
+ *    the .md mirror as HTML would have been exposed to stored XSS.
+ *  - Unterminated `<script>` / `<style>` blocks are removed up to end-of-input
+ *    so inline JS (which sometimes carries analytics tokens or API keys) can
+ *    never leak into the generated files.
+ *
  * @since 3.0.0
  */
 class HtmlFilter implements SanitizerFilterInterface
@@ -28,6 +38,8 @@ class HtmlFilter implements SanitizerFilterInterface
             return '';
         }
 
+        $content = $this->stripActiveContent($content);
+
         // <br>, </p>, </div> → newline before strip_tags so paragraph structure survives.
         $content = preg_replace(
             '#</?(?:br|p|div|li|h[1-6]|tr|blockquote)\s*/?\s*>#i',
@@ -35,16 +47,19 @@ class HtmlFilter implements SanitizerFilterInterface
             $content
         ) ?? $content;
 
-        // <script> and <style> blocks — keep contents OUT of the output.
-        $content = preg_replace('#<(script|style)[^>]*>.*?</\1>#is', '', $content) ?? $content;
-
-        // <!-- comments --> — Page Builder leaves a lot of these.
-        $content = preg_replace('/<!--.*?-->/s', '', $content) ?? $content;
+        // <!-- comments --> — Page Builder leaves a lot of these. Unterminated
+        // comments are dropped to end-of-input.
+        $content = preg_replace('/<!--.*?(-->|$)/s', '', $content) ?? $content;
 
         $content = strip_tags($content);
 
-        // Decode HTML entities (&amp; &nbsp; &#39; etc.)
+        // Decode HTML entities (&amp; &nbsp; &#39; etc.) …
         $content = html_entity_decode($content, ENT_QUOTES | ENT_HTML5, 'UTF-8');
+
+        // … then strip again: decoding can resurrect tag-like sequences
+        // (e.g. "&lt;script&gt;") that must not survive into the output.
+        $content = $this->stripActiveContent($content);
+        $content = strip_tags($content);
 
         // Collapse runs of whitespace, but preserve single newlines as paragraph hints.
         $content = preg_replace('/[ \t\x{00A0}]+/u', ' ', $content) ?? $content;
@@ -53,5 +68,18 @@ class HtmlFilter implements SanitizerFilterInterface
         // Trim each line; drop empty lines at start/end.
         $lines = array_map('trim', explode("\n", $content));
         return trim(implode("\n", $lines));
+    }
+
+    /**
+     * Remove <script>/<style> blocks INCLUDING their inner content, tolerating
+     * a missing closing tag (removed to end-of-input).
+     */
+    private function stripActiveContent(string $content): string
+    {
+        return preg_replace(
+            '#<\s*(script|style)\b[^>]*>.*?(</\s*\1\s*>|$)#is',
+            '',
+            $content
+        ) ?? $content;
     }
 }

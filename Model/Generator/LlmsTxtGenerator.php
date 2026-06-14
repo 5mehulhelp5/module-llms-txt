@@ -17,6 +17,10 @@ use Magento\Store\Api\Data\StoreInterface;
  * Output path: media/angeo/llms/llms_{store_code}.txt
  * URL:         {base_url}/llms.txt
  *
+ * @deprecated 3.2.0 Legacy per-format generator (see AbstractGenerator).
+ *             File-path resolution moved to
+ *             {@see \Angeo\LlmsTxt\Model\Output\FilePathResolver}.
+ *             WILL BE REMOVED in 4.0.0.
  * @since 3.0.0
  */
 class LlmsTxtGenerator extends AbstractGenerator
